@@ -1,0 +1,15 @@
+langchain-google-genai
+langchain-anthropic
+langchain-community
+langgraph
+pydantic
+aiohttp
+beautifulsoup4
+chromadb
+pypdf
+python-dotenv
+fastapi
+uvicorn
+python-multipart
+werkzeug
+typing-extensions

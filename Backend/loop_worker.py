@@ -1,0 +1,241 @@
+"""
+Loop Worker Module
+==================
+This module defines the core LangGraph state machine representing a single autonomous "Worker Agent".
+It utilizes a cyclic graph architecture to iteratively evaluate knowledge gaps, route to
+appropriate external tools (Search, Scrape, RAG), execute them asynchronously, and synthesize
+the findings.
+
+Elicit upgrade: the graph entry point is the Intent Classifier. It routes to:
+- converse: conversational chat replies.
+- clarify: the Research Agent clarification gate (asks for parameters when the
+  query is too broad, otherwise refines it and enters the deep loop).
+- systematic_review: the PRISMA-style 3-step pipeline.
+- evaluate_gaps: the standard Gap Analyzer multi-agent research loop, which
+  exits through the standard synthesizer or (for the 'report' workflow) the
+  heavy synthesizer producing a long-form literature review without a matrix.
+"""
+
+import asyncio
+
+from langgraph.graph import StateGraph, END
+
+# --- IMPORT THE SHARED STATE ---
+from core_engine.nodes.base_node import ResearchState
+
+# --- IMPORT THE GRAPH NODES ---
+from core_engine.nodes.intent_classifier import (
+    intent_classifier_node,
+    CONVERSATIONAL,
+    RESEARCH_AGENT,
+    SYSTEMATIC_REVIEW,
+)
+from core_engine.nodes.conversational_node import conversational_node
+from core_engine.nodes.research_agent_node import research_agent_node
+from core_engine.nodes.systematic_review_node import systematic_review_node
+from core_engine.nodes.gap_analyzer import gap_analyzer_node
+from core_engine.nodes.tool_router import tool_router_node
+from core_engine.nodes.synthesizer import synthesizer_node, heavy_synthesizer_node
+
+# --- IMPORT THE ACTION WRAPPERS (The Filters) ---
+from core_engine.nodes.actions.web_searcher import execute_search_action
+from core_engine.nodes.actions.web_scraper import execute_scrape_action
+from core_engine.nodes.actions.rag_retriever import execute_rag_action
+from core_engine.utilities.arxiv_search import arxiv_researcher
+from core_engine.utilities.progress import emit_progress
+
+
+# --- 1. THE TOOL EXECUTION NODE (CONCURRENT UPGRADE) ---
+async def execute_tools_node(state: ResearchState):
+    """
+    Executes pending tool requests concurrently using asyncio.
+    """
+    tasks = state.get("pending_tool_tasks", [])
+    emit_progress(state, f"[Tool Executor] Running {len(tasks)} research tool task(s) in parallel.")
+    print(f"\u2699\ufe0f [Tool Executor] Firing {len(tasks)} tools concurrently...")
+    
+    # Define an internal async wrapper to process each task
+    async def run_task(task):
+        if task.tool_name == "web_searcher":
+            emit_progress(state, f"[Web Searcher] Searching the web for {task.query}.")
+            result = await execute_search_action(gap=task.gap, query=task.query)
+            emit_progress(state, f"[Web Searcher] Finished reviewing web results for {task.query}.")
+            return f"--- WEB SEARCH RESULTS FOR '{task.query}' ---\n{result}"
+            
+        elif task.tool_name == "rag_retriever":
+            # "Chat with Paper" mode: restrict retrieval to the pinned document.
+            target_doc_id = state.get("target_doc_id")
+            emit_progress(state, f"[RAG Retriever] Querying the local document knowledge base for {task.query}.")
+            result = await execute_rag_action(gap=task.gap, query=task.query, doc_id=target_doc_id)
+            emit_progress(state, f"[RAG Retriever] Finished retrieving local context for {task.query}.")
+            return f"--- RAG DATABASE RESULTS FOR '{task.query}' ---\n{result}"
+            
+        elif task.tool_name == "web_crawler":
+            target_url = task.entity_website if task.entity_website else task.query
+            emit_progress(state, f"[Web Scraper] Crawling targeted website content from {target_url}.")
+            result = await execute_scrape_action(gap=task.gap, target_url=target_url)
+            emit_progress(state, f"[Web Scraper] Finished extracting targeted website content from {target_url}.")
+            return f"--- WEB SCRAPE RESULTS FOR '{target_url}' ---\n{result}"
+
+        elif task.tool_name == "arxiv_researcher":
+            emit_progress(state, f"[arXiv Researcher] Searching recent academic papers for {task.query}.")
+            result = await arxiv_researcher.ainvoke({"query": task.query})
+            emit_progress(state, f"[arXiv Researcher] Finished reviewing academic paper metadata for {task.query}.")
+            return f"--- ARXIV RESEARCH RESULTS FOR '{task.query}' ---\n{result}"
+        
+        return ""
+
+    # Fire all tools at the exact same millisecond!
+    new_findings = await asyncio.gather(*(run_task(task) for task in tasks))
+    
+    # Combine all individual tool findings into a single chronological block
+    combined_findings = "\n\n".join(new_findings) + "\n\n"
+    current_loops = state.get("loop_count", 0)
+    
+    return {
+        "research_history": combined_findings,
+        "loop_count": current_loops + 1
+    }
+
+
+# --- 2. THE CONDITIONAL ROUTING LOGIC ---
+def route_by_intent(state: ResearchState):
+    """
+    Entry router driven by the Intent Classifier.
+    - CONVERSATIONAL: streams a standard chat reply.
+    - RESEARCH_AGENT: clarification gate before the deep loop.
+    - SYSTEMATIC_REVIEW: PRISMA-style 3-step pipeline.
+    - Everything else enters the Gap Analyzer research loop.
+    """
+    route = state.get("intent_route")
+    if route == CONVERSATIONAL:
+        return "converse"
+    if route == RESEARCH_AGENT:
+        return "clarify"
+    if route == SYSTEMATIC_REVIEW:
+        return "systematic_review"
+    return "research"
+
+
+def check_clarification(state: ResearchState):
+    """After the Research Agent gate: end the turn if a clarifying question was asked."""
+    if state.get("needs_clarification"):
+        return "end"
+    return "research"
+
+
+def _synthesis_target(state: ResearchState) -> str:
+    """'report' workflow exits via heavy synthesis; everything else uses the standard synthesizer."""
+    if str(state.get("workflow_mode") or "").strip().lower() == "report":
+        return "write_report"
+    return "write_section"
+
+
+def check_research_status(state: ResearchState):
+    """
+    The traffic controller for the StateGraph.
+    
+    Evaluates the current state to determine if the agent should continue iterating
+    through the research loop or break out and proceed to document synthesis.
+    Includes a hard-stop safety mechanism to prevent infinite API loops.
+    
+    Args:
+        state (ResearchState): The current memory state.
+        
+    Returns:
+        str: The name of the next node to transition to.
+    """
+    # Hard safety limit: Force synthesis after 3 tool execution loops to conserve API quota
+    if state.get("loop_count", 0) >= 3:
+        print("\U0001f6d1 [System] Max iterations reached. Forcing Synthesis.")
+        return _synthesis_target(state)
+        
+    # Natural exit: The Gap Analyzer determined all questions have been answered
+    if state.get("research_complete"):
+        return _synthesis_target(state)
+        
+    # Default behavior: Continue the research cycle
+    return "fetch_more_data"
+
+
+# --- 3. BUILD THE GRAPH ---
+def build_loop_worker(checkpointer=None):
+    """
+    Compiles and constructs the LangGraph state machine.
+    
+    This function defines the topology of the agentic workflow, linking cognitive nodes
+    (intent gate, clarification, evaluation, routing, synthesis, systematic review)
+    with action nodes (tool execution) via directed edges.
+    
+    Args:
+        checkpointer: Optional LangGraph checkpointer (e.g. MemorySaver) enabling
+            persistent, thread-scoped state saving. When provided, callers must
+            invoke the graph with a `configurable.thread_id` config entry.
+    
+    Returns:
+        CompiledGraph: An executable LangGraph workflow ready for invocation.
+    """
+    workflow = StateGraph(ResearchState)
+    
+    # 1. Register all nodes to the graph
+    workflow.add_node("classify_intent", intent_classifier_node)
+    workflow.add_node("converse", conversational_node)
+    workflow.add_node("clarify", research_agent_node)
+    workflow.add_node("systematic_review", systematic_review_node)
+    workflow.add_node("evaluate_gaps", gap_analyzer_node)
+    workflow.add_node("route_tools", tool_router_node)
+    workflow.add_node("execute_tools", execute_tools_node)
+    workflow.add_node("synthesize", synthesizer_node)
+    workflow.add_node("heavy_synthesize", heavy_synthesizer_node)
+    
+    # 2. Define the Entry Point: the Intent Classifier gates every run
+    workflow.set_entry_point("classify_intent")
+    
+    # 2b. Intent gate: chat, clarification, and systematic review short-circuit
+    # or redirect the standard research loop
+    workflow.add_conditional_edges(
+        "classify_intent",
+        route_by_intent,
+        {
+            "converse": "converse",
+            "clarify": "clarify",
+            "systematic_review": "systematic_review",
+            "research": "evaluate_gaps"
+        }
+    )
+    
+    # 2c. Research Agent gate: a clarifying question ends the turn; otherwise
+    # the refined query enters the deep research loop
+    workflow.add_conditional_edges(
+        "clarify",
+        check_clarification,
+        {
+            "end": END,
+            "research": "evaluate_gaps"
+        }
+    )
+    
+    # 3. Define the Dynamic/Conditional Edge
+    # This determines whether we gather more data, write the standard section,
+    # or (for the 'report' workflow) write the long-form literature review
+    workflow.add_conditional_edges(
+        "evaluate_gaps",
+        check_research_status,
+        {
+            "fetch_more_data": "route_tools",
+            "write_section": "synthesize",
+            "write_report": "heavy_synthesize"
+        }
+    )
+    
+    # 4. Define the Static Edges (The standard execution pipeline)
+    workflow.add_edge("route_tools", "execute_tools")
+    workflow.add_edge("execute_tools", "evaluate_gaps") # Close the loop
+    
+    # 5. Define the Exit Points
+    workflow.add_edge("converse", END)
+    workflow.add_edge("systematic_review", END)
+    workflow.add_edge("synthesize", END)
+    workflow.add_edge("heavy_synthesize", END)
+    
+    return workflow.compile(checkpointer=checkpointer)
