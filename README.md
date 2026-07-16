@@ -71,4 +71,4 @@ Open your browser and navigate to http://localhost:3000. The frontend will autom
 
 👥 Contributors  
 Built by:  
-Shreyas Parangi, 2026
+Praveen Reddy Palla, 2026
